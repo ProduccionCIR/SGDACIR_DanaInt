@@ -9,28 +9,32 @@ class ModuloConfiguracion:
         self.tabla_perfiles = "perfiles"
         self.tabla_inventario = "productos"  # Ajustado a tu JSON
         self.tabla_logs = "logs_sistema"
-        self.roles_disponibles = ["usuario", "supervisor", "administrador", "master_it"]
+        # Roles que reconoce tu sistema
+        self.roles_disponibles = ["usuario", "supervisor", "administrador", "master", "master_it"]
 
     def registrar_log(self, accion, modulo, detalle):
         """Guarda movimientos en la base de datos"""
         usuario_actual = st.session_state.get('usuario', 'Desconocido')
-        rol_actual = st.session_state.get('rol', 'N/A')
+        # Usamos .get para evitar errores si la sesión se cierra
+        rol_actual = st.session_state.get('auth', {}).get('rol', 
+                     st.session_state.get('auth', {}).get('nivel', 'N/A'))
+        
         log_data = {
             "usuario": usuario_actual,
             "rol": rol_actual,
             "accion": accion,
             "modulo": modulo,
-            "detalle": detalle
+            "detalle": detalle,
+            "fecha": datetime.datetime.now().isoformat()
         }
         try:
-            self.db.insert(self.tabla_logs, log_data)
+            self.db.conn.table(self.tabla_logs).insert(log_data).execute()
         except:
             pass
 
     def render(self):
         st.markdown("<h2 style='color: #707070; font-weight: bold;'>⚙️ Panel de Control Maestro</h2>", unsafe_allow_html=True)
         
-        # Creamos pestañas para organizar todo y que no sea una pared de texto
         tab_usuarios, tab_datos, tab_logs, tab_mantenimiento = st.tabs([
             "👥 Usuarios", "📊 Importar/Exportar", "📜 Auditoría (Logs)", "🛡️ Mantenimiento"
         ])
@@ -43,108 +47,111 @@ class ModuloConfiguracion:
                     c1, c2, c3 = st.columns(3)
                     with c1: u = st.text_input("Nombre de Usuario")
                     with c2: p = st.text_input("Contraseña", type="password")
-                    with c3: r = st.selectbox("Rol", self.roles_disponibles)
+                    with c3: r = st.selectbox("Rol/Nivel", self.roles_disponibles)
                     
                     if st.form_submit_button("✅ Guardar Usuario"):
                         if u and p:
-                            ins = self.db.insert(self.tabla_perfiles, {"usuario": u.lower().strip(), "clave": p, "rol": r})
-                            if ins:
-                                self.registrar_log("Creación", "Configuración", f"Nuevo usuario: {u}")
+                            # Adaptamos al esquema de tu DB (nivel en lugar de rol si es necesario)
+                            nuevo_usuario = {
+                                "usuario": u.lower().strip(), 
+                                "contraseña": p, # Ajustado a tu columna 'contraseña' con ñ
+                                "nivel": r,
+                                "estado": "activo"
+                            }
+                            try:
+                                self.db.conn.table(self.tabla_perfiles).insert(nuevo_usuario).execute()
                                 st.success(f"Usuario {u} creado.")
                                 st.rerun()
+                            except Exception as e:
+                                st.error(f"Error al crear: {e}")
 
             st.markdown("---")
             st.markdown("### Usuarios Activos")
-            usuarios = self.db.fetch(self.tabla_perfiles)
-            for user in usuarios:
-                with st.container(border=True):
-                    col_info, col_rol, col_acc = st.columns([2, 2, 1])
-                    with col_info:
-                        st.write(f"**{user['usuario']}**")
-                        st.caption(f"Rol actual: {user['rol']}")
-                    with col_rol:
-                        nuevo_rol = st.selectbox("Cambiar Rol", self.roles_disponibles, 
-                                               index=self.roles_disponibles.index(user['rol']) if user['rol'] in self.roles_disponibles else 0,
-                                               key=f"edit_rol_{user['id']}")
-                    with col_acc:
-                        if st.button("💾", key=f"btn_save_{user['id']}"):
-                            upd = self.db.update(self.tabla_perfiles, {"rol": nuevo_rol}, user['id'])
-                            if upd:
-                                st.toast("Rol actualizado")
+            try:
+                res = self.db.conn.table(self.tabla_perfiles).select("*").execute()
+                usuarios = res.data if res.data else []
+                
+                for user in usuarios:
+                    # FIX CRÍTICO: Detectar si la columna es 'rol' o 'nivel'
+                    rol_usuario = user.get('rol') if user.get('rol') else user.get('nivel', 'usuario')
+                    
+                    with st.container(border=True):
+                        col_info, col_rol, col_acc = st.columns([2, 2, 1])
+                        with col_info:
+                            st.write(f"**{user['usuario']}**")
+                            st.caption(f"Nivel actual: {rol_usuario}")
+                        with col_rol:
+                            # Buscamos el índice del rol para el selectbox
+                            try:
+                                idx = self.roles_disponibles.index(rol_usuario)
+                            except:
+                                idx = 0
+                                
+                            nuevo_rol = st.selectbox("Cambiar Nivel", self.roles_disponibles, 
+                                                   index=idx,
+                                                   key=f"edit_rol_{user['id']}")
+                        with col_acc:
+                            if st.button("💾", key=f"btn_save_{user['id']}"):
+                                # Actualizamos la columna correcta (nivel)
+                                self.db.conn.table(self.tabla_perfiles).update({"nivel": nuevo_rol}).eq("id", user['id']).execute()
+                                st.toast("Nivel actualizado")
                                 st.rerun()
+            except Exception as e:
+                st.error(f"No se pudieron cargar los usuarios: {e}")
 
-        # --- PESTAÑA 2: IMPORTACIÓN Y EXPORTACIÓN ---
+        # --- PESTAÑA 2: DATOS ---
         with tab_datos:
             st.subheader("Centro de Datos")
             col_up, col_down = st.columns(2)
-            
             with col_up:
-                st.info("Subir Inventario desde Excel")
+                st.info("Subir Clientes desde Excel")
                 archivo = st.file_uploader("Archivo .xlsx", type=["xlsx"])
                 if archivo:
                     df = pd.read_excel(archivo)
                     if st.button("🚀 Procesar Importación"):
                         registros = df.to_dict(orient='records')
-                        for reg in registros:
-                            self.db.insert(self.tabla_inventario, reg)
-                        self.registrar_log("Importación", "Datos", f"Carga masiva: {len(registros)} items")
-                        st.success("¡Importación exitosa!")
+                        try:
+                            self.db.conn.table("clientes").insert(registros).execute()
+                            st.success("¡Importación exitosa!")
+                        except Exception as e:
+                            st.error(f"Error: {e}")
 
             with col_down:
-                st.info("Descargar Plantilla")
-                columnas = ["barcode", "nombre", "referencia", "stock", "precio_costo", "p5", "p10"]
-                df_template = pd.DataFrame(columns=columnas)
+                st.info("Descargar Plantilla Clientes")
+                df_template = pd.DataFrame(columns=["nombre_completo", "cedula_ruc", "es_extranjero"])
                 output = BytesIO()
                 with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
-                    df_template.to_excel(writer, index=False)
-                st.download_button("📥 Bajar Formato Excel", data=output.getvalue(), 
-                                 file_name="plantilla_inventario.xlsx", use_container_width=True)
+                    df_template.to_excel(writer, sheet_name='Plantilla', index=False)
+                st.download_button("📥 Bajar Formato", data=output.getvalue(), 
+                                 file_name="plantilla_clientes.xlsx", use_container_width=True)
 
-        # --- PESTAÑA 3: LOGS (AUDITORÍA) ---
+        # --- PESTAÑA 3: LOGS ---
         with tab_logs:
-            st.subheader("Historial de Actividad 24/7")
+            st.subheader("Auditoría")
             try:
-                logs_data = self.db.fetch(self.tabla_logs)
-                if logs_data:
-                    df_logs = pd.DataFrame(logs_data)
-                    df_logs['fecha'] = pd.to_datetime(df_logs['fecha']).dt.strftime('%d/%m/%Y %H:%M')
-                    st.dataframe(df_logs.sort_values('fecha', ascending=False), use_container_width=True, hide_index=True)
+                res_logs = self.db.conn.table(self.tabla_logs).select("*").order("fecha", desc=True).limit(100).execute()
+                if res_logs.data:
+                    st.dataframe(pd.DataFrame(res_logs.data), use_container_width=True)
                 else:
-                    st.warning("No hay registros de actividad.")
+                    st.info("Sin actividad reciente.")
             except:
-                st.error("Tabla de logs no encontrada en la base de datos.")
+                st.info("Tabla de logs no disponible aún.")
 
-        # --- PESTAÑA 4: MANTENIMIENTO Y BACKUP (TU GANANCIA) ---
+        # --- PESTAÑA 4: MANTENIMIENTO ---
         with tab_mantenimiento:
             st.subheader("Seguridad y Respaldo")
-            st.write("Esta sección permite asegurar la integridad de la información para el plan de mantenimiento.")
-            
-            with st.container(border=True):
-                st.markdown("#### 💾 Generar Backup del Sistema")
-                st.write("Descarga un archivo maestro con toda la información de la base de datos.")
-                
-                if st.button("🛠️ Preparar Respaldo Completo", use_container_width=True):
-                    # Recolección de datos
-                    data_prod = self.db.fetch("productos")
-                    data_ventas = self.db.fetch("ventas")
-                    data_perfiles = self.db.fetch("perfiles")
+            if st.button("🛠️ Preparar Respaldo de Clientes y Perfiles", use_container_width=True):
+                try:
+                    c = self.db.conn.table("clientes").select("*").execute().data
+                    p = self.db.conn.table("perfiles").select("*").execute().data
                     
                     output_bak = BytesIO()
                     with pd.ExcelWriter(output_bak, engine='xlsxwriter') as writer:
-                        pd.DataFrame(data_prod).to_excel(writer, sheet_name='Inventario', index=False)
-                        pd.DataFrame(data_ventas).to_excel(writer, sheet_name='Ventas', index=False)
-                        pd.DataFrame(data_perfiles).to_excel(writer, sheet_name='Usuarios', index=False)
+                        pd.DataFrame(c).to_excel(writer, sheet_name='Clientes', index=False)
+                        pd.DataFrame(p).to_excel(writer, sheet_name='Usuarios', index=False)
                     
-                    st.download_button(
-                        label="⬇️ Descargar Backup (.xlsx)",
-                        data=output_bak.getvalue(),
-                        file_name=f"BACKUP_SGE_CIR_{datetime.date.today()}.xlsx",
-                        mime="application/vnd.ms-excel",
-                        use_container_width=True
-                    )
-            
-            with st.expander("🚨 Zona de Peligro"):
-                st.warning("Estas acciones son irreversibles.")
-                if st.button("Borrar Logs Antiguos"):
-                    # Aquí iría la lógica de limpieza
-                    st.error("Función protegida por seguridad.")
+                    st.download_button("⬇️ Descargar Backup", data=output_bak.getvalue(),
+                                     file_name=f"BACKUP_SGDA_{datetime.date.today()}.xlsx",
+                                     use_container_width=True)
+                except Exception as e:
+                    st.error(f"Error al generar backup: {e}")
